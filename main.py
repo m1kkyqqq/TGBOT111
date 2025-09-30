@@ -236,40 +236,51 @@ class PremiumBot:
         logger.info("📊 Обработано аккаунтов: %s", len(result_accounts))
         return result_accounts
 
+    @staticmethod
+    def _prepare_proxy(proxy_raw: Optional[str]) -> Optional[Dict[str, object]]:
+        """Преобразует строку вида `ip:port[:login:password]` в словарь telethon."""
+        if not proxy_raw:
+            return None
+
+        proxy_raw = proxy_raw.strip()
+        if not proxy_raw or ':' not in proxy_raw:
+            return None
+
+        parts = proxy_raw.split(':')
+        try:
+            host = parts[0]
+            port = int(parts[1])
+        except (ValueError, IndexError):
+            logger.error("❌ Некорректный формат прокси: %s", proxy_raw)
+            return None
+
+        proxy: Dict[str, object] = {
+            'proxy_type': 'http',
+            'addr': host,
+            'port': port,
+        }
+
+        if len(parts) >= 4:
+            proxy['username'] = parts[2]
+            proxy['password'] = parts[3]
+
+        return proxy
+
     async def create_telegram_client(self, account_data: Dict) -> Optional[TelegramClient]:
         """Создание клиента напрямую из tdata"""
         try:
-            proxy = None
-            if account_data.get('proxy'):
-                proxy_str = account_data['proxy']
-                # Парсим прокси в формате telethon
-                if ':' in proxy_str:
-                    parts = proxy_str.split(':')
-                    if len(parts) == 6:  # ip:port:login:pass:type:region
-                        proxy = {
-                            'proxy_type': 'http',
-                            'addr': parts[0],
-                            'port': int(parts[1]),
-                            'username': parts[2],
-                            'password': parts[3]
-                        }
-                    elif len(parts) == 2:  # ip:port
-                        proxy = {
-                            'proxy_type': 'http',
-                            'addr': parts[0],
-                            'port': int(parts[1]),
-                        }
+            proxy = self._prepare_proxy(account_data.get('proxy'))
 
             tdata_path = account_data.get('tdata_path')
             if tdata_path and tdata_path.exists():
-                logger.info(f"📁 Используем tdata напрямую: {tdata_path}")
-                
+                logger.info("📁 Используем tdata напрямую: %s", tdata_path)
+
                 # Используем родительскую папку tdata как сессию
                 session_path = tdata_path.parent
-                
+
                 client = TelegramClient(
                     str(session_path),
-                    API_ID, 
+                    API_ID,
                     API_HASH,
                     proxy=proxy,
                     device_model="Samsung Galaxy S21",
@@ -279,11 +290,11 @@ class PremiumBot:
                     system_lang_code="en-US"
                 )
                 return client
-            
+
             return None
-            
+
         except Exception as e:
-            logger.error(f"❌ Ошибка создания клиента: {e}")
+            logger.error("❌ Ошибка создания клиента: %s", e)
             return None
 
     async def test_session(self, account_data: Dict) -> bool:
