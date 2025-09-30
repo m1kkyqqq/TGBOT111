@@ -255,9 +255,9 @@ class PremiumBot:
                         }
                     elif len(parts) == 2:  # ip:port
                         proxy = {
-                            'proxy_type': 'http', 
+                            'proxy_type': 'http',
                             'addr': parts[0],
-                            'port': int(parts[1])
+                            'port': int(parts[1]),
                         }
 
             tdata_path = account_data.get('tdata_path')
